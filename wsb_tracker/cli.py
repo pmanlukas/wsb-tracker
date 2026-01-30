@@ -618,9 +618,17 @@ def stats() -> None:
     table.add_row("Database Size", f"{stats.get('db_size_mb', 0):.2f} MB")
 
     if stats.get("oldest_mention"):
-        table.add_row("Oldest Data", stats["oldest_mention"].strftime("%Y-%m-%d %H:%M"))
+        oldest = stats["oldest_mention"]
+        if isinstance(oldest, str):
+            table.add_row("Oldest Data", oldest[:16])  # Already formatted string
+        else:
+            table.add_row("Oldest Data", oldest.strftime("%Y-%m-%d %H:%M"))
     if stats.get("newest_mention"):
-        table.add_row("Newest Data", stats["newest_mention"].strftime("%Y-%m-%d %H:%M"))
+        newest = stats["newest_mention"]
+        if isinstance(newest, str):
+            table.add_row("Newest Data", newest[:16])  # Already formatted string
+        else:
+            table.add_row("Newest Data", newest.strftime("%Y-%m-%d %H:%M"))
 
     console.print(table)
 
