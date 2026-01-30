@@ -1,0 +1,75 @@
+@import "tailwindcss";
+
+/* Custom colors */
+@theme {
+  --color-wsb-green: #10B981;
+  --color-wsb-red: #EF4444;
+  --color-wsb-orange: #F59E0B;
+  --color-wsb-blue: #3B82F6;
+}
+
+/* Base styles */
+body {
+  @apply bg-gray-900 text-gray-100 min-h-screen;
+}
+
+/* Component classes */
+.card {
+  @apply bg-gray-800 rounded-lg border border-gray-700 p-4;
+}
+
+.btn {
+  @apply px-4 py-2 rounded-lg font-medium transition-colors;
+}
+
+.btn-primary {
+  @apply bg-wsb-blue hover:bg-blue-600 text-white;
+}
+
+.btn-success {
+  @apply bg-wsb-green hover:bg-green-600 text-white;
+}
+
+.btn-danger {
+  @apply bg-wsb-red hover:bg-red-600 text-white;
+}
+
+.sentiment-bullish {
+  @apply text-wsb-green;
+}
+
+.sentiment-bearish {
+  @apply text-wsb-red;
+}
+
+.sentiment-neutral {
+  @apply text-gray-400;
+}
+
+.heat-high {
+  @apply text-wsb-red font-bold;
+}
+
+.heat-medium {
+  @apply text-wsb-orange;
+}
+
+.heat-low {
+  @apply text-wsb-green;
+}
+
+/* Animation */
+@keyframes slide-in {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.animate-slide-in {
+  animation: slide-in 0.3s ease-out;
+}

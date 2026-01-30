@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  wsb-tracker:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist database
+      - wsb-data:/data
+    environment:
+      - WSB_DB_PATH=/data/wsb_tracker.db
+      - WSB_SCAN_LIMIT=100
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/stats')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Development service with hot reload
+  wsb-tracker-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "8000:8000"
+      - "5173:5173"
+    volumes:
+      - .:/app
+      - wsb-data-dev:/data
+      - /app/frontend/node_modules
+    environment:
+      - WSB_DB_PATH=/data/wsb_tracker.db
+      - WSB_SCAN_LIMIT=50
+    profiles:
+      - dev
+
+volumes:
+  wsb-data:
+  wsb-data-dev:

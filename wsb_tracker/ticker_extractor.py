@@ -3,15 +3,22 @@
 This module identifies potential stock tickers in Reddit posts using:
 1. High confidence: $TICKER format (cashtag)
 2. Contextual patterns: "buying X", "calls on X", etc.
-3. Standalone: ALL CAPS words validated against known tickers
+3. Standalone: ALL CAPS words validated against authoritative database
 
-Includes comprehensive false positive filtering for WSB slang,
-common words, time references, and financial acronyms.
+Validation is performed against:
+- Local SQLite database of ~10,000 valid US tickers
+- OpenFIGI API for unknown high-confidence matches
 """
 
 import re
+import logging
 from dataclasses import dataclass
 from typing import Optional
+
+from wsb_tracker.ticker_database import get_ticker_database, is_valid_ticker as db_is_valid
+from wsb_tracker.openfigi import validate_ticker_openfigi
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -35,12 +42,16 @@ class TickerMatch:
 
 
 class TickerExtractor:
-    """Extract stock ticker symbols from text with false positive filtering.
+    """Extract stock ticker symbols from text with database validation.
 
     The extractor uses multiple strategies:
     1. $TICKER format: Highest confidence (0.95)
     2. Contextual patterns: Medium confidence (0.8)
-    3. Standalone ALL CAPS: Lower confidence (0.6), requires validation
+    3. Standalone ALL CAPS: Lower confidence (0.6)
+
+    All extracted tickers are validated against:
+    - Local database of ~10,000 valid US tickers (stocks, ETFs, commodities, forex, crypto)
+    - OpenFIGI API for high-confidence matches not in local database
 
     Usage:
         extractor = TickerExtractor()
@@ -86,6 +97,12 @@ class TickerExtractor:
         "FRI", "SAT", "SUN", "AM", "PM", "EST", "PST", "CST",
         "UTC", "GMT", "EDT", "PDT", "CDT", "MDT", "MST",
 
+        # Very common short words (2-3 letters) - always exclude
+        # These may match obscure international tickers but are almost always false positives
+        "MY", "IN", "OF", "AT", "TO", "BY", "IF", "OR", "AS", "IS", "IT",
+        "NO", "BE", "WE", "AN", "SO", "UP", "ON", "DO", "GO", "HE", "ME",
+        "US", "AM", "AX", "OX", "EX",
+
         # Common words that could be mistaken for tickers
         "ARE", "THE", "FOR", "AND", "NOT", "ALL", "CAN", "HAS",
         "HIS", "HER", "NEW", "NOW", "OLD", "OUR", "OUT", "OWN",
@@ -120,6 +137,12 @@ class TickerExtractor:
         "WAN", "WED", "WET", "WIG", "WIT", "WOE", "WOK", "WON",
         "WOO", "YAK", "YAM", "YAP", "YAW", "YEA", "YEN", "YES",
         "YEW", "YIN", "ZIP", "ZIT", "ZOO",
+
+        # Longer common words that may match obscure tickers
+        "THESE", "THOSE", "ABOUT", "AFTER", "FIRST", "BEING",
+        "OTHER", "WHICH", "THEIR", "THERE", "WHERE", "WOULD",
+        "COULD", "SHOULD", "EVERY", "STILL", "WHILE", "THINK",
+        "THING", "DOING", "GOING", "NEVER", "SINCE", "UNTIL",
 
         # Other common false positives
         "LIKE", "JUST", "WILL", "LOOK", "MAKE", "KNOW", "TIME",
@@ -188,9 +211,8 @@ class TickerExtractor:
         "DIS", "CMCSA", "NFLX", "WBD", "PARA", "FOX", "FOXA",
         "VZ", "TMUS", "CHTR", "LUMN",
 
-        # Potential conflicts with exclusions (validated tickers)
-        "AI", "ON", "IT", "UP", "GO", "SO", "DO", "RE", "OR", "AN",
-        "DD", "CC", "FL", "IP", "HR", "PR", "ED", "ES", "CL", "WY",
+        # Valid 2-letter US tickers (some may look like words)
+        "AI", "CC", "FL", "IP", "HR", "PR", "ED", "CL", "WY",
     })
 
     # Regex patterns
@@ -211,20 +233,37 @@ class TickerExtractor:
         self,
         additional_exclusions: Optional[set[str]] = None,
         additional_known: Optional[set[str]] = None,
+        use_database: bool = True,
+        use_openfigi: bool = True,
     ) -> None:
         """Initialize extractor with optional custom lists.
 
         Args:
             additional_exclusions: Extra terms to filter out
             additional_known: Extra valid tickers to recognize
+            use_database: Whether to validate against local ticker database
+            use_openfigi: Whether to use OpenFIGI API for unknown tickers
         """
         self.exclusions = set(self.EXCLUSIONS)
         self.known_tickers = set(self.KNOWN_TICKERS)
+        self.use_database = use_database
+        self.use_openfigi = use_openfigi
 
         if additional_exclusions:
             self.exclusions.update(t.upper() for t in additional_exclusions)
         if additional_known:
             self.known_tickers.update(t.upper() for t in additional_known)
+
+        # Initialize database if enabled
+        if self.use_database:
+            try:
+                db = get_ticker_database()
+                if db.needs_refresh():
+                    logger.info("Ticker database needs refresh, updating...")
+                    db.refresh()
+            except Exception as e:
+                logger.warning(f"Failed to initialize ticker database: {e}")
+                self.use_database = False
 
     def extract(self, text: str) -> list[TickerMatch]:
         """Extract all valid ticker symbols from text.
@@ -245,14 +284,15 @@ class TickerExtractor:
         # Pass 1: $TICKER format (highest confidence)
         for match in self.DOLLAR_TICKER_PATTERN.finditer(text):
             ticker = match.group(1).upper()
-            if self._is_valid_ticker(ticker, has_dollar=True):
+            confidence = 0.95
+            if self._is_valid_ticker(ticker, has_dollar=True, confidence=confidence):
                 if ticker not in matches:
                     matches[ticker] = TickerMatch(
                         ticker=ticker,
                         start=match.start(),
                         end=match.end(),
                         context=self._get_context(text, match.start(), match.end()),
-                        confidence=0.95,
+                        confidence=confidence,
                         has_dollar_sign=True,
                     )
 
@@ -260,30 +300,31 @@ class TickerExtractor:
         for pattern in self.CONTEXTUAL_PATTERNS:
             for match in pattern.finditer(text):
                 ticker = match.group(1).upper()
-                if ticker not in matches and self._is_valid_ticker(ticker, has_dollar=False):
+                confidence = 0.8
+                if ticker not in matches and self._is_valid_ticker(ticker, has_dollar=False, confidence=confidence):
                     matches[ticker] = TickerMatch(
                         ticker=ticker,
                         start=match.start(),
                         end=match.end(),
                         context=self._get_context(text, match.start(), match.end()),
-                        confidence=0.8,
+                        confidence=confidence,
                         has_dollar_sign=False,
                     )
 
-        # Pass 3: Standalone ALL CAPS (lower confidence, stricter validation)
+        # Pass 3: Standalone ALL CAPS (lower confidence - database validation only, no API)
         for match in self.STANDALONE_TICKER_PATTERN.finditer(text):
             ticker = match.group(1).upper()
-            if ticker not in matches and self._is_valid_ticker(ticker, has_dollar=False):
-                # Only accept if it's a known ticker or 3+ chars
-                if ticker in self.known_tickers or len(ticker) >= 3:
-                    matches[ticker] = TickerMatch(
-                        ticker=ticker,
-                        start=match.start(),
-                        end=match.end(),
-                        context=self._get_context(text, match.start(), match.end()),
-                        confidence=0.6,
-                        has_dollar_sign=False,
-                    )
+            confidence = 0.6
+            # For low-confidence matches, only validate against local database (no API calls)
+            if ticker not in matches and self._is_valid_ticker(ticker, has_dollar=False, confidence=confidence):
+                matches[ticker] = TickerMatch(
+                    ticker=ticker,
+                    start=match.start(),
+                    end=match.end(),
+                    context=self._get_context(text, match.start(), match.end()),
+                    confidence=confidence,
+                    has_dollar_sign=False,
+                )
 
         return list(matches.values())
 
@@ -298,15 +339,16 @@ class TickerExtractor:
         """
         return {match.ticker for match in self.extract(text)}
 
-    def _is_valid_ticker(self, ticker: str, has_dollar: bool) -> bool:
-        """Validate a potential ticker symbol.
+    def _is_valid_ticker(self, ticker: str, has_dollar: bool, confidence: float = 0.5) -> bool:
+        """Validate a potential ticker symbol against authoritative sources.
 
         Args:
             ticker: Potential ticker symbol (uppercase)
             has_dollar: Whether it had a $ prefix
+            confidence: Extraction confidence (used to decide on API validation)
 
         Returns:
-            True if the ticker appears valid
+            True if the ticker is a valid security symbol
         """
         # Must be 1-5 uppercase letters
         if not ticker.isalpha() or not ticker.isupper():
@@ -319,15 +361,28 @@ class TickerExtractor:
         if len(ticker) == 1 and not has_dollar:
             return False
 
-        # If it's a known ticker, always accept (overrides exclusions)
-        if has_dollar and ticker in self.known_tickers:
-            return True
-
-        # Check exclusion list
+        # Always exclude common false positives (these are never real tickers)
         if ticker in self.exclusions:
             return False
 
-        return True
+        # Layer 1: Check local database (fast, ~10,000 valid symbols)
+        if self.use_database:
+            if db_is_valid(ticker):
+                return True
+
+        # If database validation is disabled, fall back to known tickers list
+        if not self.use_database and ticker in self.known_tickers:
+            return True
+
+        # Layer 2: For high-confidence matches, try OpenFIGI API
+        if self.use_openfigi and confidence >= 0.8:
+            figi_result = validate_ticker_openfigi(ticker)
+            if figi_result:
+                logger.debug(f"Validated {ticker} via OpenFIGI: {figi_result.name}")
+                return True
+
+        # Not found in any authoritative source
+        return False
 
     def _get_context(self, text: str, start: int, end: int) -> str:
         """Extract context around a match.

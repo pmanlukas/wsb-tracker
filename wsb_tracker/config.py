@@ -73,7 +73,7 @@ class Settings(BaseSettings):
         description="Sort method for fetching posts",
     )
     subreddits: str = Field(
-        default="wallstreetbets",
+        default="wallstreetbets,stocks,investing,options,stockmarket,pennystocks,SPACs,smallstreetbets,thetagang,Vitards,weedstocks",
         description="Comma-separated list of subreddits to monitor",
     )
 
@@ -127,8 +127,8 @@ class Settings(BaseSettings):
     lookback_hours: int = Field(
         default=24,
         ge=1,
-        le=168,
-        description="Hours to look back for trend comparison",
+        le=720,
+        description="Hours to look back for trend comparison (max 30 days = 720 hours)",
     )
 
     # Output Settings

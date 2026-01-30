@@ -9,6 +9,10 @@ Provides commands:
 - stats: Show database statistics
 - config: View configuration
 - cleanup: Remove old data
+- serve: Start API server
+- refresh-tickers: Refresh local ticker database
+- validate-ticker: Check if a ticker is valid
+- cleanup-db: Remove invalid tickers from mentions
 """
 
 import json
@@ -28,7 +32,10 @@ from wsb_tracker import __version__
 from wsb_tracker.config import get_settings
 from wsb_tracker.database import get_database
 from wsb_tracker.models import SentimentLabel, TickerSummary, TrackerSnapshot
+from wsb_tracker.ticker_info import get_ticker_info_service, TickerInfo
 from wsb_tracker.tracker import WSBTracker
+from wsb_tracker.ticker_database import get_ticker_database, TickerDatabase
+from wsb_tracker.openfigi import validate_ticker_openfigi
 
 
 # Create CLI app
@@ -106,8 +113,18 @@ def format_trend(change_pct: Optional[float]) -> str:
     return "→ 0%"
 
 
-def create_ticker_table(summaries: list[TickerSummary], title: str = "Top Tickers") -> Table:
-    """Create a Rich table for ticker summaries."""
+def create_ticker_table(
+    summaries: list[TickerSummary],
+    title: str = "Top Tickers",
+    show_info: bool = True,
+) -> Table:
+    """Create a Rich table for ticker summaries.
+
+    Args:
+        summaries: List of ticker summaries to display
+        title: Table title
+        show_info: Whether to show name and type columns (uses ticker info service)
+    """
     table = Table(
         title=title,
         show_header=True,
@@ -118,6 +135,9 @@ def create_ticker_table(summaries: list[TickerSummary], title: str = "Top Ticker
 
     table.add_column("#", style="dim", width=3, justify="right")
     table.add_column("Ticker", style="bold white", width=7)
+    if show_info:
+        table.add_column("Name", style="white", width=22, no_wrap=True)
+        table.add_column("Type", style="dim cyan", width=6)
     table.add_column("Heat", width=8, justify="center")
     table.add_column("Mentions", width=8, justify="right")
     table.add_column("Sentiment", width=14)
@@ -125,23 +145,66 @@ def create_ticker_table(summaries: list[TickerSummary], title: str = "Top Ticker
     table.add_column("DD", width=4, justify="right")
     table.add_column("Score", width=8, justify="right")
 
+    # Fetch ticker info for all tickers if showing info
+    ticker_info_map: dict[str, TickerInfo] = {}
+    if show_info:
+        service = get_ticker_info_service()
+        for summary in summaries:
+            ticker_info_map[summary.ticker] = service.get_info(summary.ticker)
+
     for i, summary in enumerate(summaries, 1):
         sentiment_color = get_sentiment_color(summary.sentiment_label)
         sentiment_emoji = get_sentiment_emoji(summary.sentiment_label)
 
-        table.add_row(
-            str(i),
-            f"${summary.ticker}",
-            format_heat_score(summary.heat_score),
-            str(summary.mention_count),
-            Text(
-                f"{sentiment_emoji} {summary.avg_sentiment:+.2f}",
-                style=sentiment_color,
-            ),
-            format_trend(summary.mention_change_pct),
-            str(summary.dd_count) if summary.dd_count > 0 else "—",
-            f"{summary.total_score:,}",
-        )
+        if show_info:
+            info = ticker_info_map.get(summary.ticker)
+            name = info.name if info else summary.ticker
+            # Truncate long names
+            if len(name) > 20:
+                name = name[:19] + "…"
+            sec_type = info.security_type if info else "?"
+            # Abbreviate type for display
+            type_abbrev = {
+                "Stock": "Stock",
+                "ETF": "ETF",
+                "Index": "Index",
+                "Crypto": "Crypto",
+                "Unknown": "?",
+                "Mutual Fund": "Fund",
+                "Currency": "FX",
+                "Futures": "Fut",
+                "Options": "Opt",
+            }.get(sec_type, sec_type[:5])
+
+            table.add_row(
+                str(i),
+                f"${summary.ticker}",
+                name,
+                type_abbrev,
+                format_heat_score(summary.heat_score),
+                str(summary.mention_count),
+                Text(
+                    f"{sentiment_emoji} {summary.avg_sentiment:+.2f}",
+                    style=sentiment_color,
+                ),
+                format_trend(summary.mention_change_pct),
+                str(summary.dd_count) if summary.dd_count > 0 else "—",
+                f"{summary.total_score:,}",
+            )
+        else:
+            table.add_row(
+                str(i),
+                f"${summary.ticker}",
+                format_heat_score(summary.heat_score),
+                str(summary.mention_count),
+                Text(
+                    f"{sentiment_emoji} {summary.avg_sentiment:+.2f}",
+                    style=sentiment_color,
+                ),
+                format_trend(summary.mention_change_pct),
+                str(summary.dd_count) if summary.dd_count > 0 else "—",
+                f"{summary.total_score:,}",
+            )
 
     return table
 
@@ -513,6 +576,10 @@ def top(
         False, "--json", "-j",
         help="Output as JSON",
     ),
+    no_info: bool = typer.Option(
+        False, "--no-info",
+        help="Skip ticker name/type lookup for faster output",
+    ),
 ) -> None:
     """Show top trending tickers from database."""
     tracker = WSBTracker()
@@ -524,9 +591,22 @@ def top(
         raise typer.Exit(1)
 
     if output_json:
+        # Include ticker info in JSON output if not disabled
+        ticker_info_data = {}
+        if not no_info:
+            service = get_ticker_info_service()
+            for s in summaries:
+                info = service.get_info(s.ticker)
+                ticker_info_data[s.ticker] = {
+                    "name": info.name,
+                    "type": info.security_type,
+                }
+
         output = [
             {
                 "ticker": s.ticker,
+                "name": ticker_info_data.get(s.ticker, {}).get("name", s.ticker),
+                "type": ticker_info_data.get(s.ticker, {}).get("type", "Unknown"),
                 "heat_score": s.heat_score,
                 "mention_count": s.mention_count,
                 "avg_sentiment": s.avg_sentiment,
@@ -538,7 +618,7 @@ def top(
         return
 
     console.print(f"\n[bold]Top {len(summaries)} Tickers[/bold] (last {hours}h)\n")
-    table = create_ticker_table(summaries)
+    table = create_ticker_table(summaries, show_info=not no_info)
     console.print(table)
 
 
@@ -699,6 +779,227 @@ def cleanup(
         title="Cleanup Results",
         border_style="green",
     ))
+
+
+@app.command()
+def serve(
+    host: str = typer.Option(
+        "127.0.0.1", "--host", "-h",
+        help="Host to bind to",
+    ),
+    port: int = typer.Option(
+        8000, "--port", "-p",
+        help="Port to bind to",
+    ),
+    reload: bool = typer.Option(
+        False, "--reload", "-r",
+        help="Enable auto-reload for development",
+    ),
+) -> None:
+    """Start the API server.
+
+    Runs a FastAPI server that provides REST API and WebSocket endpoints
+    for the WSB Tracker. Use this to power a web dashboard.
+
+    Examples:
+
+        wsb serve                    # Start on localhost:8000
+
+        wsb serve --port 3000        # Use different port
+
+        wsb serve --host 0.0.0.0     # Allow external connections
+
+        wsb serve --reload           # Auto-reload for development
+    """
+    try:
+        import uvicorn
+    except ImportError:
+        console.print(
+            "[red]Error:[/red] uvicorn is not installed.\n"
+            "Install API dependencies with: pip install wsb-tracker[api]"
+        )
+        raise typer.Exit(1)
+
+    console.print(
+        Panel(
+            f"[green]Starting WSB Tracker API[/green]\n\n"
+            f"  URL: http://{host}:{port}\n"
+            f"  API Docs: http://{host}:{port}/docs\n"
+            f"  WebSocket: ws://{host}:{port}/ws\n\n"
+            f"Press Ctrl+C to stop",
+            title="API Server",
+            border_style="green",
+        )
+    )
+
+    uvicorn.run(
+        "wsb_tracker.api.main:app",
+        host=host,
+        port=port,
+        reload=reload,
+        log_level="info",
+    )
+
+
+@app.command(name="refresh-tickers")
+def refresh_tickers(
+    force: bool = typer.Option(
+        False, "--force", "-f",
+        help="Force refresh even if database is recent",
+    ),
+) -> None:
+    """Refresh the local ticker database from authoritative sources.
+
+    Downloads valid tickers from:
+    - GitHub US-Stock-Symbols repository (~10,000 US stocks)
+    - Adds ETFs, indices, commodities, forex, and crypto symbols
+
+    The database is stored locally and used for fast ticker validation.
+    """
+    db = get_ticker_database()
+
+    if not force and not db.needs_refresh():
+        console.print("[yellow]Database is up to date (refreshed within 24h).[/yellow]")
+        console.print("Use --force to refresh anyway.")
+        return
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        progress.add_task("[cyan]Refreshing ticker database...", total=None)
+        count = db.refresh()
+
+    console.print(f"[green]✓[/green] Loaded {count:,} valid tickers into database")
+    console.print(f"  Database path: {db.db_path}")
+
+
+@app.command(name="validate-ticker")
+def validate_ticker(
+    symbol: str = typer.Argument(..., help="Ticker symbol to validate (e.g., GME)"),
+    use_api: bool = typer.Option(
+        True, "--api/--no-api",
+        help="Use OpenFIGI API for unknown tickers",
+    ),
+) -> None:
+    """Check if a ticker symbol is valid.
+
+    Validates against:
+    1. Local database (~10,000 US stocks, ETFs, commodities, forex, crypto)
+    2. OpenFIGI API (if --api is enabled and not in local database)
+    """
+    symbol = symbol.upper()
+    db = get_ticker_database()
+
+    # Check local database first
+    info = db.get_ticker_info(symbol)
+
+    if info:
+        console.print(f"[green]✓[/green] {symbol} is a valid ticker")
+        console.print(f"  Name: {info.name or '(not available)'}")
+        console.print(f"  Exchange: {info.exchange}")
+        console.print(f"  Type: {info.asset_type}")
+        return
+
+    # Try OpenFIGI if enabled
+    if use_api:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            progress.add_task(f"[cyan]Looking up {symbol} via OpenFIGI...", total=None)
+            figi = validate_ticker_openfigi(symbol)
+
+        if figi:
+            console.print(f"[yellow]~[/yellow] {symbol} found via OpenFIGI (not in local database)")
+            console.print(f"  Name: {figi.name}")
+            console.print(f"  Exchange: {figi.exchange}")
+            console.print(f"  Type: {figi.security_type}")
+            console.print(f"  FIGI: {figi.figi}")
+            return
+
+    console.print(f"[red]✗[/red] {symbol} is not a valid ticker")
+    raise typer.Exit(1)
+
+
+@app.command(name="cleanup-db")
+def cleanup_db(
+    dry_run: bool = typer.Option(
+        True, "--dry-run/--apply",
+        help="Show what would be deleted without actually deleting",
+    ),
+) -> None:
+    """Remove invalid tickers from the mentions database.
+
+    This command identifies mentions in the database that reference
+    tickers not found in the authoritative ticker database, and
+    optionally removes them.
+
+    Use --dry-run (default) to preview changes, --apply to execute.
+    """
+    db = get_ticker_database()
+    tracker_db = get_database()
+
+    # Ensure ticker database is populated
+    if db.needs_refresh():
+        console.print("[yellow]Ticker database needs refresh, updating first...[/yellow]")
+        db.refresh()
+
+    # Get all unique tickers from mentions
+    with tracker_db._get_connection() as conn:
+        cursor = conn.execute("SELECT DISTINCT ticker FROM mentions")
+        all_tickers = [row[0] for row in cursor.fetchall()]
+
+    console.print(f"Found {len(all_tickers)} unique tickers in mentions database")
+
+    # Check each ticker
+    invalid_tickers = []
+    for ticker in all_tickers:
+        if not db.is_valid_ticker(ticker):
+            invalid_tickers.append(ticker)
+
+    if not invalid_tickers:
+        console.print("[green]✓[/green] All tickers in database are valid")
+        return
+
+    console.print(f"\n[yellow]Found {len(invalid_tickers)} invalid tickers:[/yellow]")
+
+    # Show table of invalid tickers
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Ticker", style="bold red")
+    table.add_column("Status")
+
+    for ticker in sorted(invalid_tickers)[:50]:  # Show first 50
+        table.add_row(ticker, "Invalid - not in authoritative database")
+
+    if len(invalid_tickers) > 50:
+        table.add_row("...", f"({len(invalid_tickers) - 50} more)")
+
+    console.print(table)
+
+    if dry_run:
+        console.print("\n[dim]This is a dry run. Use --apply to remove these tickers.[/dim]")
+        return
+
+    # Actually delete
+    confirm = typer.confirm(f"Delete {len(invalid_tickers)} invalid ticker mentions?")
+    if not confirm:
+        raise typer.Abort()
+
+    deleted_count = 0
+    with tracker_db._get_connection() as conn:
+        for ticker in invalid_tickers:
+            cursor = conn.execute(
+                "DELETE FROM mentions WHERE ticker = ?",
+                (ticker,)
+            )
+            deleted_count += cursor.rowcount
+
+    console.print(f"[green]✓[/green] Deleted {deleted_count:,} mentions for {len(invalid_tickers)} invalid tickers")
 
 
 def version_callback(value: bool) -> None:

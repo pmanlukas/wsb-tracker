@@ -40,6 +40,21 @@ dev = [
 reddit-api = [
     "praw>=7.7.0",
 ]
+ticker-info = [
+    "yfinance>=0.2.0",
+]
+api = [
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "websockets>=12.0",
+]
+all = [
+    "praw>=7.7.0",
+    "yfinance>=0.2.0",
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "websockets>=12.0",
+]
 
 [project.scripts]
 wsb = "wsb_tracker.cli:app"

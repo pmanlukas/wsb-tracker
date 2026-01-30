@@ -56,6 +56,8 @@ class Database:
     CREATE INDEX IF NOT EXISTS idx_mentions_timestamp ON mentions(timestamp);
     CREATE INDEX IF NOT EXISTS idx_mentions_ticker_timestamp ON mentions(ticker, timestamp);
     CREATE INDEX IF NOT EXISTS idx_mentions_subreddit ON mentions(subreddit);
+    CREATE INDEX IF NOT EXISTS idx_mentions_sentiment ON mentions(sentiment_compound);
+    CREATE INDEX IF NOT EXISTS idx_mentions_dd ON mentions(is_dd_post);
 
     -- Periodic snapshots for historical analysis
     CREATE TABLE IF NOT EXISTS snapshots (
@@ -122,6 +124,11 @@ class Database:
             detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
         )
         conn.row_factory = sqlite3.Row
+        # Performance optimizations
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA cache_size = 10000")
+        conn.execute("PRAGMA temp_store = MEMORY")
         try:
             yield conn
             conn.commit()
@@ -347,6 +354,7 @@ class Database:
             List of TickerSummary objects sorted by mention count
         """
         since = datetime.utcnow() - timedelta(hours=hours)
+        summaries = []
         with self._get_connection() as conn:
             cursor = conn.execute(
                 """
@@ -358,7 +366,8 @@ class Database:
                     SUM(CASE WHEN is_dd_post = 1 THEN 1 ELSE 0 END) as dd_count,
                     SUM(post_score) as total_score,
                     MIN(timestamp) as first_seen,
-                    MAX(timestamp) as last_seen
+                    MAX(timestamp) as last_seen,
+                    COUNT(CASE WHEN sentiment_compound > 0.15 THEN 1 END) as bullish_count
                 FROM mentions
                 WHERE timestamp >= ?
                 GROUP BY ticker
@@ -368,38 +377,22 @@ class Database:
                 """,
                 (since, min_mentions, limit),
             )
-            rows = cursor.fetchall()
-
-        summaries = []
-        for row in rows:
-            # Calculate bullish ratio for each ticker
-            cursor = conn.execute(
-                """
-                SELECT
-                    COUNT(CASE WHEN sentiment_compound > 0.15 THEN 1 END) as bullish_count,
-                    COUNT(*) as total_count
-                FROM mentions
-                WHERE ticker = ? AND timestamp >= ?
-                """,
-                (row["ticker"], since),
-            )
-            ratio_row = cursor.fetchone()
-            bullish_ratio = (
-                ratio_row["bullish_count"] / ratio_row["total_count"]
-                if ratio_row["total_count"] > 0 else 0.0
-            )
-
-            summaries.append(TickerSummary(
-                ticker=row["ticker"],
-                mention_count=row["mention_count"],
-                unique_posts=row["unique_posts"],
-                avg_sentiment=round(row["avg_sentiment"], 4),
-                bullish_ratio=round(bullish_ratio, 4),
-                total_score=row["total_score"] or 0,
-                dd_count=row["dd_count"],
-                first_seen=row["first_seen"],
-                last_seen=row["last_seen"],
-            ))
+            for row in cursor.fetchall():
+                bullish_ratio = (
+                    row["bullish_count"] / row["mention_count"]
+                    if row["mention_count"] > 0 else 0.0
+                )
+                summaries.append(TickerSummary(
+                    ticker=row["ticker"],
+                    mention_count=row["mention_count"],
+                    unique_posts=row["unique_posts"],
+                    avg_sentiment=round(row["avg_sentiment"], 4),
+                    bullish_ratio=round(bullish_ratio, 4),
+                    total_score=row["total_score"] or 0,
+                    dd_count=row["dd_count"],
+                    first_seen=row["first_seen"],
+                    last_seen=row["last_seen"],
+                ))
 
         return summaries
 
