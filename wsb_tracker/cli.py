@@ -781,6 +781,30 @@ def cleanup(
     ))
 
 
+def _is_port_in_use(host: str, port: int) -> bool:
+    """Check if a port is already in use."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+            return False
+        except OSError:
+            return True
+
+
+def _check_existing_wsb_server(host: str, port: int) -> bool:
+    """Check if WSB Tracker API is already running on this port."""
+    try:
+        import httpx
+        response = httpx.get(f"http://{host}:{port}/api/health", timeout=2.0)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("status") == "healthy"
+    except Exception:
+        pass
+    return False
+
+
 @app.command()
 def serve(
     host: str = typer.Option(
@@ -818,6 +842,33 @@ def serve(
             "[red]Error:[/red] uvicorn is not installed.\n"
             "Install API dependencies with: pip install wsb-tracker[api]"
         )
+        raise typer.Exit(1)
+
+    # Check if port is already in use
+    if _is_port_in_use(host, port):
+        if _check_existing_wsb_server(host, port):
+            console.print(
+                Panel(
+                    f"[yellow]WSB Tracker API is already running on port {port}![/yellow]\n\n"
+                    f"The server is healthy at: http://{host}:{port}\n"
+                    f"API docs at: http://{host}:{port}/docs\n\n"
+                    f"If you want to restart, stop the existing server first (Ctrl+C).",
+                    title="ℹ️  Server Already Running",
+                    border_style="yellow",
+                )
+            )
+        else:
+            console.print(
+                Panel(
+                    f"[red]Port {port} is already in use![/red]\n\n"
+                    f"Another application is using this port.\n\n"
+                    f"Options:\n"
+                    f"  • Use a different port: [cyan]wsb serve --port {port + 1}[/cyan]\n"
+                    f"  • Check what's using the port: [cyan]lsof -i :{port}[/cyan]",
+                    title="⚠️  Port Conflict",
+                    border_style="red",
+                )
+            )
         raise typer.Exit(1)
 
     console.print(

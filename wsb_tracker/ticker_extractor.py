@@ -102,6 +102,10 @@ class TickerExtractor:
         "MY", "IN", "OF", "AT", "TO", "BY", "IF", "OR", "AS", "IS", "IT",
         "NO", "BE", "WE", "AN", "SO", "UP", "ON", "DO", "GO", "HE", "ME",
         "US", "AM", "AX", "OX", "EX",
+        # 2-letter words that are valid tickers but cause too many false positives
+        # These will only be recognized with $ prefix (e.g., $AI, $CC)
+        "AI", "CC", "FL", "IP", "HR", "PR", "ED", "CL", "WY", "TV", "OS",
+        "PC", "IT", "UK", "EU", "OK", "AC", "DC", "DJ", "CD", "HD", "PS",
 
         # Common words that could be mistaken for tickers
         "ARE", "THE", "FOR", "AND", "NOT", "ALL", "CAN", "HAS",
@@ -211,8 +215,9 @@ class TickerExtractor:
         "DIS", "CMCSA", "NFLX", "WBD", "PARA", "FOX", "FOXA",
         "VZ", "TMUS", "CHTR", "LUMN",
 
-        # Valid 2-letter US tickers (some may look like words)
-        "AI", "CC", "FL", "IP", "HR", "PR", "ED", "CL", "WY",
+        # Valid 2-letter US tickers - only with $ prefix due to false positive risk
+        # These are NOT in KNOWN_TICKERS because standalone 2-letter matches are too noisy
+        # They will only be detected with $AI, $CC etc. format
     })
 
     # Regex patterns
@@ -357,12 +362,14 @@ class TickerExtractor:
         if len(ticker) < 1 or len(ticker) > 5:
             return False
 
-        # Single-letter tickers only valid with $ prefix
-        if len(ticker) == 1 and not has_dollar:
+        # Single-letter and 2-letter tickers only valid with $ prefix
+        # They're too often false positives otherwise (AI, CC, HR, etc.)
+        if len(ticker) <= 2 and not has_dollar:
             return False
 
-        # Always exclude common false positives (these are never real tickers)
-        if ticker in self.exclusions:
+        # Exclude common false positives, UNLESS it has a $ prefix
+        # (e.g., standalone "AI" is excluded, but "$AI" is valid)
+        if ticker in self.exclusions and not has_dollar:
             return False
 
         # Layer 1: Check local database (fast, ~10,000 valid symbols)

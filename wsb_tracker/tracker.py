@@ -6,15 +6,18 @@ The WSBTracker class ties together:
 - Sentiment analyzer for scoring mentions
 - Database for persistence
 - Alert system for notifications
+- LLM analyzer for extracting trading ideas (optional)
 """
 
+import logging
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import Callable, Optional
+from typing import Callable, Optional, TYPE_CHECKING
 
 from wsb_tracker.config import get_settings, Settings
 from wsb_tracker.database import Database, get_database
+from wsb_tracker.runtime_settings import get_runtime_settings
 from wsb_tracker.models import (
     Alert,
     RedditPost,
@@ -27,6 +30,11 @@ from wsb_tracker.models import (
 from wsb_tracker.reddit_client import BaseRedditClient, get_reddit_client
 from wsb_tracker.sentiment import WSBSentimentAnalyzer, get_analyzer
 from wsb_tracker.ticker_extractor import TickerExtractor, get_extractor
+
+if TYPE_CHECKING:
+    from wsb_tracker.llm_analyzer import TradingIdeaAnalyzer
+
+logger = logging.getLogger(__name__)
 
 
 class WSBTracker:
@@ -54,6 +62,7 @@ class WSBTracker:
         analyzer: Optional[WSBSentimentAnalyzer] = None,
         database: Optional[Database] = None,
         settings: Optional[Settings] = None,
+        llm_analyzer: Optional["TradingIdeaAnalyzer"] = None,
     ) -> None:
         """Initialize tracker with optional dependency injection.
 
@@ -66,12 +75,35 @@ class WSBTracker:
             analyzer: Sentiment analyzer
             database: Database for persistence
             settings: Configuration settings
+            llm_analyzer: Optional LLM analyzer for trading ideas
         """
         self.settings = settings or get_settings()
         self.reddit = reddit_client or get_reddit_client()
         self.extractor = extractor or get_extractor()
         self.analyzer = analyzer or get_analyzer()
         self.db = database or get_database()
+
+        # Initialize LLM analyzer if enabled
+        self.llm_analyzer: Optional["TradingIdeaAnalyzer"] = llm_analyzer
+        if llm_analyzer is None and self.settings.llm_enabled:
+            self._init_llm_analyzer()
+
+    def _init_llm_analyzer(self) -> None:
+        """Initialize LLM analyzer if available and configured."""
+        try:
+            from wsb_tracker.llm_analyzer import get_analyzer as get_llm_analyzer
+            self.llm_analyzer = get_llm_analyzer()
+            if self.llm_analyzer.is_available():
+                logger.info("LLM analyzer initialized and available")
+            else:
+                logger.warning("LLM analyzer initialized but not available (missing credentials?)")
+                self.llm_analyzer = None
+        except ImportError as e:
+            logger.warning(f"LLM analyzer not available: {e}")
+            self.llm_analyzer = None
+        except Exception as e:
+            logger.error(f"Failed to initialize LLM analyzer: {e}")
+            self.llm_analyzer = None
 
     def scan(
         self,
@@ -98,16 +130,20 @@ class WSBTracker:
         Returns:
             TrackerSnapshot with scan results
         """
-        # Use config defaults if not specified
-        subreddits = subreddits or self.settings.subreddit_list
-        limit = limit if limit is not None else self.settings.scan_limit
-        sort = sort or self.settings.scan_sort
-        min_score = min_score if min_score is not None else self.settings.min_score
+        # Use runtime settings (which fall back to config defaults)
+        runtime = get_runtime_settings()
+        subreddits = subreddits or runtime.subreddits
+        limit = limit if limit is not None else runtime.scan_limit
+        sort = sort or runtime.scan_sort
+        min_score = min_score if min_score is not None else runtime.min_score
 
         start_time = time.time()
         posts_analyzed = 0
         all_mentions: list[TickerMention] = []
         ticker_data: dict[str, list[TickerMention]] = {}
+
+        # Track posts for LLM analysis
+        posts_for_llm: list[tuple[RedditPost, list[TickerMention]]] = []
 
         # Scan each subreddit
         for subreddit in subreddits:
@@ -137,9 +173,30 @@ class WSBTracker:
                     if on_mention:
                         on_mention(mention)
 
+                # Queue for LLM analysis if qualifying
+                if mentions and self.llm_analyzer and self.llm_analyzer.should_analyze(post):
+                    posts_for_llm.append((post, mentions))
+
         # Save mentions to database
         if all_mentions:
             self.db.save_mentions(all_mentions)
+
+        # Run LLM analysis on qualifying posts
+        llm_analyses = 0
+        if posts_for_llm and self.llm_analyzer:
+            logger.info(f"Running LLM analysis on {len(posts_for_llm)} qualifying posts")
+            for post, mentions in posts_for_llm:
+                try:
+                    # Analyze each ticker mentioned in the post
+                    for mention in mentions:
+                        result = self.llm_analyzer.analyze_mention(mention, post)
+                        if result and not result.error:
+                            llm_analyses += 1
+                except Exception as e:
+                    logger.error(f"LLM analysis failed for post {post.id}: {e}")
+
+            if llm_analyses > 0:
+                logger.info(f"Completed {llm_analyses} LLM analyses")
 
         # Build ticker summaries
         summaries = self._build_summaries(ticker_data)

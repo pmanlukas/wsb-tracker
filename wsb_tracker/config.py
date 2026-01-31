@@ -5,6 +5,7 @@ with fallback to .env file. Supports both Reddit API credentials
 (when available) and credential-free operation using public JSON endpoints.
 """
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -146,6 +147,55 @@ class Settings(BaseSettings):
         default=None,
         description="Discord webhook URL for notifications",
     )
+
+    # LLM Configuration
+    llm_enabled: bool = Field(
+        default=False,
+        description="Enable LLM-based trading idea extraction",
+    )
+    anthropic_api_key: Optional[str] = Field(
+        default=None,
+        description="Anthropic API key for Claude",
+    )
+    llm_model: str = Field(
+        default="claude-sonnet-4-20250514",
+        description="Claude model to use for analysis",
+    )
+    llm_min_post_score: int = Field(
+        default=50,
+        ge=0,
+        description="Minimum post score to trigger LLM analysis",
+    )
+    llm_analyze_dd_only: bool = Field(
+        default=False,
+        description="Only analyze DD (Due Diligence) posts",
+    )
+    llm_max_daily_calls: int = Field(
+        default=100,
+        ge=0,
+        description="Maximum LLM API calls per day (0 = unlimited)",
+    )
+    llm_cache_hours: int = Field(
+        default=24,
+        ge=1,
+        le=168,
+        description="Hours to cache LLM analysis results",
+    )
+
+    @property
+    def has_llm_credentials(self) -> bool:
+        """Check if LLM API credentials are configured."""
+        return bool(self.get_anthropic_api_key())
+
+    def get_anthropic_api_key(self) -> Optional[str]:
+        """Get Anthropic API key from config or environment.
+
+        Checks both WSB_ANTHROPIC_API_KEY and ANTHROPIC_API_KEY env vars.
+        """
+        if self.anthropic_api_key:
+            return self.anthropic_api_key
+        # Fall back to checking ANTHROPIC_API_KEY directly
+        return os.environ.get("ANTHROPIC_API_KEY")
 
     @field_validator("db_path", mode="before")
     @classmethod
